@@ -1,6 +1,4 @@
 /*
- *  $Id: descry.c,v 1.1.1.1 2002/05/28 17:06:45 route Exp $
- *
  *  Building Open Source Network Security Tools
  *  descry.c - Network Intrusion Detection Technique example code
  *
@@ -28,29 +26,23 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
- *
  */
 
 #include "./descry.h"
 
-int 
-main(int argc, char* argv[])
+int
+main(int argc, char *argv[])
 {
     int c;
-    u_char flags;
-    char *device;
-    char *capture_file;
+    uint8_t flags = 0;
+    const char *device = NULL;
+    const char *capture_file = NULL;
     struct descry_pack *gp;
 
     printf("Descry 1.0 [TCP port scan detection tool]\n");
 
-    flags = 0;
-    device = NULL;
-    capture_file = NULL;
-    while ((c = getopt(argc, argv, "ahf:i:vs")) != EOF)
-    {
-        switch (c)
-        {
+    while ((c = getopt(argc, argv, "ahf:i:vs")) != -1) {
+        switch (c) {
             case 'a':
                 flags |= ALL_HOSTS;
                 break;
@@ -68,266 +60,240 @@ main(int argc, char* argv[])
             case 'h':
             default:
                 usage(argv[0]);
-                return (EXIT_FAILURE);
+                return EXIT_FAILURE;
         }
     }
 
-    /* either read from a capture file OR run on the network */
-    if (capture_file && device)
-    {
+    if (capture_file && device) {
         usage(argv[0]);
-        return (EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    if (descry_init(&gp, device, capture_file, flags) == 0)
-    {
+    if (descry_init(&gp, device, capture_file, flags) == 0) {
         fprintf(stderr, "descry_init(): catastrophic failure\n");
-        return (EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    while (pcap_dispatch(gp->p, 0, (pcap_handler)descry, (u_char*)gp));
+    while (pcap_dispatch(gp->p, 0, (pcap_handler)descry, (uint8_t *)gp) >= 0)
+        ;
 
     descry_destroy(gp);
-
-    return (EXIT_SUCCESS);
+    return EXIT_SUCCESS;
 }
 
 int
-descry_init(struct descry_pack **gp, char *device, char *capture_file,
-        u_char flags)
+descry_init(struct descry_pack **gp, const char *device,
+            const char *capture_file, uint8_t flags)
 {
-    char *interface = NULL;
+    char iface_buf[256] = {0};
+    const char *interface = NULL;
     char error[PCAP_ERRBUF_SIZE];
     struct bpf_program prog;
-    u_int32_t network, netmask;
+    bpf_u_int32 network = 0;
+    bpf_u_int32 netmask = PCAP_NETMASK_UNKNOWN;
 
-    *gp = malloc(sizeof(struct descry_pack));
-    if (*gp == NULL)
-    {
-        perror("descry_init(): malloc(): ");
-        return (0);
+    *gp = calloc(1, sizeof(struct descry_pack));
+    if (*gp == NULL) {
+        perror("descry_init(): calloc()");
+        return 0;
     }
 
-    /* initialize the patricia trie */
-    if (pt_init(&((*gp)->pt)) == 0)
-    {
-        /* error set in pt_init() */
-        return (EXIT_FAILURE);
+    if (pt_init(&((*gp)->pt)) == 0) {
+        free(*gp);
+        *gp = NULL;
+        return 0;
     }
 
-    /* control flags */
     (*gp)->flags = flags;
 
-    if (capture_file)
-    {
-        /* we have a capture file to analyze */
+    if (capture_file) {
         (*gp)->p = pcap_open_offline(capture_file, error);
-        if ((*gp)->p == NULL)
-        {
-            fprintf(stderr, "pcap_open_offline() %s\n", error);
-            return (0);
+        if ((*gp)->p == NULL) {
+            fprintf(stderr, "pcap_open_offline(): %s\n", error);
+            free((*gp)->pt);
+            free(*gp);
+            *gp = NULL;
+            return 0;
         }
-    }
-    else
-    {
-        /* we're doing a live capture, do we have a device? */
-        if (device)
-        {
+    } else {
+        if (device) {
             interface = device;
-        }
-        else
-        {
-            interface = pcap_lookupdev(error);
-            if (interface == NULL)
-            {
-                fprintf(stderr, "pcap_lookupdev(): %s\n", error);
-                return (0);
+        } else {
+            /* pcap_lookupdev is deprecated; use pcap_findalldevs */
+            pcap_if_t *alldevs = NULL;
+            if (pcap_findalldevs(&alldevs, error) == -1 || alldevs == NULL) {
+                fprintf(stderr, "pcap_findalldevs(): %s\n", error);
+                free((*gp)->pt);
+                free(*gp);
+                *gp = NULL;
+                return 0;
             }
+            /* skip loopback and pseudo-devices, pick first with an address */
+            pcap_if_t *chosen = NULL;
+            for (pcap_if_t *d = alldevs; d != NULL; d = d->next) {
+                if (d->flags & PCAP_IF_LOOPBACK)
+                    continue;
+                if (d->addresses != NULL) {
+                    chosen = d;
+                    break;
+                }
+            }
+            if (chosen == NULL)
+                chosen = alldevs;
+
+            snprintf(iface_buf, sizeof(iface_buf), "%s", chosen->name);
+            fprintf(stderr, "Auto-selected interface: %s\n", iface_buf);
+            interface = iface_buf;
+            pcap_freealldevs(alldevs);
+
+            (*gp)->p = pcap_open_live(interface, MAX_PACKET,
+                    ((*gp)->flags & ALL_HOSTS) ? 1 : 0, 1000, error);
+            if ((*gp)->p == NULL) {
+                fprintf(stderr, "pcap_open_live(): %s\n", error);
+                free((*gp)->pt);
+                free(*gp);
+                *gp = NULL;
+                return 0;
+            }
+            goto filter_setup;
         }
+
         (*gp)->p = pcap_open_live(interface, MAX_PACKET,
-                ((*gp)->flags & ALL_HOSTS), 0, error);
-            if ((*gp)->p == NULL)
-        {
-            fprintf(stderr, "pcap_open_live() %s\n", error);
-            return (0);
+                ((*gp)->flags & ALL_HOSTS) ? 1 : 0, 1000, error);
+        if ((*gp)->p == NULL) {
+            fprintf(stderr, "pcap_open_live(): %s\n", error);
+            free((*gp)->pt);
+            free(*gp);
+            *gp = NULL;
+            return 0;
         }
     }
 
-    /* get the length of the link layer header */
-    switch (pcap_datalink((*gp)->p))
-    {
+filter_setup:
+    switch (pcap_datalink((*gp)->p)) {
         case DLT_SLIP:
-            /* a little SLIPstreaming!  Whoops!  There's Charlie! */
             (*gp)->offset = 0x10;
             break;
         case DLT_PPP:
-            /* PPP y0 */
             (*gp)->offset = 0x04;
             break;
-        default:
         case DLT_EN10MB:
-            /* good old ethernet or something like it I hope! */
-            (*gp)->offset = 0x0e;
+        default:
+            (*gp)->offset = ETHER_HDR_LEN;
             break;
     }
 
-    if (interface)
-    {
-        /* compile our filter and apply it to the interface */
-        if (pcap_lookupnet(interface, &network, &netmask, error) < 0)
-        {
-            fprintf(stderr, "pcap_lookupnet() %s\n", error);
-            return (0);
+    if (interface) {
+        if (pcap_lookupnet(interface, &network, &netmask, error) < 0) {
+            fprintf(stderr, "pcap_lookupnet(): %s\n", error);
+            netmask = PCAP_NETMASK_UNKNOWN;
         }
     }
-    if (pcap_compile((*gp)->p, &prog, FILTER, 1, netmask) < 0)
-    {
+
+    if (pcap_compile((*gp)->p, &prog, FILTER, 1, netmask) < 0) {
         fprintf(stderr, "pcap_compile(): \"%s\" failed\n", FILTER);
-        return (0);
-    }
-    if (pcap_setfilter((*gp)->p, &prog) < 0)
-    {
-        fprintf(stderr, "pcap_setfilter() failed\n");
+        pcap_close((*gp)->p);
+        free((*gp)->pt);
+        free(*gp);
+        *gp = NULL;
         return 0;
     }
-    return (1);
+    if (pcap_setfilter((*gp)->p, &prog) < 0) {
+        fprintf(stderr, "pcap_setfilter() failed\n");
+        pcap_freecode(&prog);
+        pcap_close((*gp)->p);
+        free((*gp)->pt);
+        free(*gp);
+        *gp = NULL;
+        return 0;
+    }
+    pcap_freecode(&prog);
+    return 1;
 }
 
 void
 descry_destroy(struct descry_pack *gp)
 {
-    /* do something someday*/
+    if (gp == NULL)
+        return;
+    if (gp->p)
+        pcap_close(gp->p);
+    free(gp->pt);
+    free(gp);
 }
 
 void
-descry(u_char *u, struct pcap_pkthdr *phdr, u_char *packet)
+descry(uint8_t *u, struct pcap_pkthdr *phdr, const uint8_t *packet)
 {
-    struct libnet_ipv4_hdr *ip;
-    struct libnet_tcp_hdr *tcp;
+    struct ip *ip_hdr;
+    struct tcphdr *tcp_hdr;
     struct descry_pack *gp;
-    struct tcp_connection *c;
-    struct tcp_connection *rc;
-    static u_char cleanup = 0;
+    struct tcp_connection *c = NULL;
+    struct tcp_connection *rc = NULL;
+    static unsigned int cleanup = 0;
     struct timeval ts;
+    uint8_t tcp_flags;
+    int ip_hdr_len;
 
-    rc = NULL;
-    c = NULL;
     gp = (struct descry_pack *)u;
 
-    /*
-     *  In order to keep the trie from growing boundlessly, we need to
-     *  periodically expire half open connections.
-     */
-    if (cleanup++ > CLEANUP_INTERVAL)
-    {
+    if (cleanup++ > CLEANUP_INTERVAL) {
+        ts.tv_sec = phdr->ts.tv_sec;
         ts.tv_usec = phdr->ts.tv_usec;
-        ts.tv_sec  = phdr->ts.tv_sec;
-
-        /* expire old connections */
         pt_expire(gp, &ts);
         cleanup = 0;
     }
 
-    /*
-     *  Ignore packets that do not have an entire TCP header.  Currently
-     *  this code does not handle fragmented TCP headers and will not
-     *  detect scans that use them.
-     */
-    if (phdr->len < (gp->offset + LIBNET_IPV4_H + LIBNET_TCP_H))
-    {
+    if (phdr->len < (unsigned int)(gp->offset + MIN_IP_HDR_LEN + MIN_TCP_HDR_LEN))
         return;
-    }
 
-    /* overlay IP and TCP headers */
-    ip = (struct libnet_ipv4_hdr *)(packet + gp->offset);
-    tcp = (struct libnet_tcp_hdr *)(packet + gp->offset +
-            (ip->ip_hl << 2));
+    ip_hdr = (struct ip *)(packet + gp->offset);
+    ip_hdr_len = ip_hdr->ip_hl << 2;
+    tcp_hdr = (struct tcphdr *)(packet + gp->offset + ip_hdr_len);
 
-    /* shave off the lower order 6 bits containing the control flags */
-    switch (tcp->th_flags & 0x3F)
-    {
-        case (TH_SYN | TH_ACK):
-            /* this is a new connection to be added to the trie */
+    /* extract TCP flags - use th_flags on Linux (struct tcphdr) */
+    tcp_flags = ((const uint8_t *)tcp_hdr)[13];
 
-            /* get memory for the connection state */
-            c = malloc(sizeof (struct tcp_connection));
+    switch (tcp_flags & 0x3F) {
+        case (TCP_FLAG_SYN | TCP_FLAG_ACK):
+            c = calloc(1, sizeof(struct tcp_connection));
             if (c == NULL)
-            {
                 return;
-            }
 
-            /* set connection state */
             memcpy(&(c->ts), &(phdr->ts), sizeof(struct timeval));
-            /*
-             *  The context for the connection state is biased towards
-             *  the initiator of the TCP connection.  Since this TCP 
-             *  segment is the SYN|ACK (response from server), we reverse 
-             *  the source and destination when filling in the connection
-             *  information.
-             */
-            SET_STATE(c, ip->ip_src.s_addr, tcp->th_sport,
-                    ip->ip_dst.s_addr, tcp->th_dport, tcp->th_ack);
+            SET_STATE(c, ip_hdr->ip_src.s_addr, tcp_hdr->th_sport,
+                      ip_hdr->ip_dst.s_addr, tcp_hdr->th_dport,
+                      tcp_hdr->th_ack);
 
-            /* insert TCP connection into the trie */
-            if (pt_insert(gp->pt, c) == 0)
-            {
+            if (pt_insert(gp->pt, c) == 0) {
                 fprintf(stderr, "pt_insert() failed!\n");
+                free(c);
             }
             break;
-        case (TH_FIN | TH_ACK):
-        case (TH_RST):
-        case (TH_RST | TH_ACK):
-            /* connection teardown */
 
-            /* get memory for the connection state */
-            c = malloc(sizeof (struct tcp_connection));
+        case (TCP_FLAG_FIN | TCP_FLAG_ACK):
+        case TCP_FLAG_RST:
+        case (TCP_FLAG_RST | TCP_FLAG_ACK):
+            c = calloc(1, sizeof(struct tcp_connection));
             if (c == NULL)
-            {
                 return;
-            }
-            /* set connection state so we can search for the connection */
-            SET_STATE(c, ip->ip_dst.s_addr, tcp->th_dport,
-                    ip->ip_src.s_addr, tcp->th_sport, tcp->th_seq);
 
-            /*
-             *  Search the trie to see if this connection teadown
-             *  corresponds to one of ours.  We are looking for TCP
-             *  connections where the initiator sends a SYN segment
-             *  and the destination host is listening and responds
-             *  with a SYN-ACK segment.  Next the initiator closes the
-             *  connection with a FIN-ACK, RST-ACK, or RST segment
-             *  WITHOUT ever sending any data on the connection.  This
-             *  condition is usually a good indicator of someone doing
-             *  a full-open (connect) port scan to see if a service is
-             *  listening.
-             */
-            if (pt_find(gp->pt, c, &rc))
-            {
-                /*
-                 *  Check the state of the connection to see if it's a
-                 *  possible port scan.  If the sequence number hasn't
-                 *  been incremented past "1", the connection was opened
-                 *  then immediately closed.  Most full open TCP port
-                 *  scanners work in this fashion and will be detected.
-                 */
+            SET_STATE(c, ip_hdr->ip_dst.s_addr, tcp_hdr->th_dport,
+                      ip_hdr->ip_src.s_addr, tcp_hdr->th_sport,
+                      tcp_hdr->th_seq);
+
+            if (pt_find(gp->pt, c, &rc)) {
                 check_state(gp, c, rc);
-
-                /* delete the connection from the trie */
                 pt_delete(gp->pt, rc);
-            }
-	    else  
-            {
-               /*
-                *   Did not find the connection.  Assuming the initiator
-                *   sent the teardown request, so we will try again
-                *   while making the assumption that the server sent it.
-                */
-                SET_STATE(c, ip->ip_src.s_addr, tcp->th_sport,
-                          ip->ip_dst.s_addr, tcp->th_dport, tcp->th_ack);
+            } else {
+                SET_STATE(c, ip_hdr->ip_src.s_addr, tcp_hdr->th_sport,
+                          ip_hdr->ip_dst.s_addr, tcp_hdr->th_dport,
+                          tcp_hdr->th_ack);
                 pt_delete(gp->pt, c);
-	    }
-            free(c); 
-	    break;
+            }
+            free(c);
+            break;
+
         default:
             break;
     }
@@ -335,235 +301,164 @@ descry(u_char *u, struct pcap_pkthdr *phdr, u_char *packet)
 
 void
 check_state(struct descry_pack *gp, struct tcp_connection *con1,
-        struct tcp_connection *con2)
+            struct tcp_connection *con2)
 {
-    /* check sequence number delta to see if data was sent */
     if (ntohl(con1->seq) >= ntohl(con2->seq) &&
-        ntohl(con1->seq) <= ntohl(con2->seq) + 2)
-    {
-        if (gp->flags & DO_SYSLOG)
-        {
+        ntohl(con1->seq) <= ntohl(con2->seq) + 2) {
+        char src_str[INET_ADDRSTRLEN];
+        char dst_str[INET_ADDRSTRLEN];
+
+        inet_ntop(AF_INET, &con1->src_addr, src_str, sizeof(src_str));
+        inet_ntop(AF_INET, &con1->dst_addr, dst_str, sizeof(dst_str));
+
+        if (gp->flags & DO_SYSLOG) {
             syslog(LOG_NOTICE,
                 "Possible TCP port scan from %s:%d to %s:%d",
-                libnet_addr2name4(con1->src_addr.s_addr,
-                        LIBNET_DONT_RESOLVE),
-                ntohs(con1->src_port),
-                libnet_addr2name4(con1->dst_addr.s_addr,
-                        LIBNET_DONT_RESOLVE),
-                ntohs(con1->dst_port));
-        }
-        else
-        {
-            fprintf(stderr,
-                "[%s] TCP probe from %s:%d to %s:%d\n",
+                src_str, ntohs(con1->src_port),
+                dst_str, ntohs(con1->dst_port));
+        } else {
+            fprintf(stderr, "[%s] TCP probe from %s:%d to %s:%d\n",
                 get_time(),
-                libnet_addr2name4(con1->src_addr.s_addr,
-                        LIBNET_DONT_RESOLVE),
-                ntohs(con1->src_port),
-                libnet_addr2name4(con1->dst_addr.s_addr,
-                        LIBNET_DONT_RESOLVE),
-                ntohs(con1->dst_port));
+                src_str, ntohs(con1->src_port),
+                dst_str, ntohs(con1->dst_port));
         }
     }
 }
 
-void 
-pt_make_key(u_char *key, struct tcp_connection *c)
+void
+pt_make_key(uint8_t *key, const struct tcp_connection *c)
 {
-    if (c == NULL)
-    {
+    if (c == NULL) {
         fprintf(stderr, "pt_make_key(): c is NULL!\n");
         return;
     }
-    /* create a key for the trie from connection info */
     memcpy(key, &(c->src_addr.s_addr), 4);
     memcpy(key + 4, &(c->src_port), 2);
     memcpy(key + 6, &(c->dst_addr.s_addr), 4);
     memcpy(key + 10, &(c->dst_port), 2);
 }
 
-struct pt_node * 
+struct pt_node *
 pt_new(int bit, struct pt_node *l, struct pt_node *r,
-        struct tcp_connection *con)
+       struct tcp_connection *con)
 {
-    struct pt_node *p = NULL;
-
-    p = malloc(sizeof(struct pt_node));
-    if (p)
-    {
+    struct pt_node *p = calloc(1, sizeof(struct pt_node));
+    if (p) {
         p->bit = bit;
         p->l = l;
         p->r = r;
         p->con = con;
+        p->removed = false;
     }
-    return (p);
+    return p;
 }
 
-int 
+int
 pt_init(struct pt_context **p)
 {
-    *p = malloc(sizeof(struct pt_context));
-    if (*p == NULL)
-    {
-        perror("pt_init(): malloc(): ");
-        return (0);
+    *p = calloc(1, sizeof(struct pt_context));
+    if (*p == NULL) {
+        perror("pt_init(): calloc()");
+        return 0;
     }
+    return 1;
+}
 
-    /* point the head node to NULL and set the node counter to 0 */
-    (*p)->head = NULL;
-    (*p)->n = 0;
-
-    return (1);
-}	
-
-int 
-get_bit(u_char *key, struct pt_node *n)
+int
+get_bit(const uint8_t *key, struct pt_node *n)
 {
-    u_char conkey[KEY_BYTES];
+    uint8_t conkey[KEY_BYTES];
 
-    memset(conkey, NULL, KEY_BYTES);
-    if (n->bit < MIN_KEY_BIT || n->bit > MAX_KEY_BIT)
-    {
+    memset(conkey, 0, KEY_BYTES);
+    if (n->bit < MIN_KEY_BIT || n->bit > MAX_KEY_BIT) {
         pt_make_key(conkey, n->con);
         if (memcmp(key, conkey, KEY_BYTES) == 0)
-        {
-            /* found a match! */
-            return (2);
-        }
+            return 2;
         else
-        {
-            /* did not match */
-            return (3);
-        }
+            return 3;
     }
-    /*
-     *  The key is treated as one long binary string starting from the
-     *  left, which corresponds to MSB key[0].  The math finds the
-     *  appropriate byte through integer division, finds the bit through
-     *  modulus 8, and then shifts the bit down and masks the value to
-     *  get an integer of value 1 or 0.
-     */
     return ((key[n->bit / 8] >> (7 - (n->bit % 8))) & 0x01);
 }
 
-int 
-pt_search_r(struct pt_node *n, u_char *key, struct pt_node **rc)
+int
+pt_search_r(struct pt_node *n, uint8_t *key, struct pt_node **rc)
 {
-    /* extract bit from the key */
-    switch (get_bit(key, n))
-    {
+    switch (get_bit(key, n)) {
         case 0:
-            return (pt_search_r(n->l, key, rc));
+            return pt_search_r(n->l, key, rc);
         case 1:
-            return (pt_search_r(n->r, key, rc));
+            return pt_search_r(n->r, key, rc);
         case 2:
             *rc = n;
-            return (1);
+            return 1;
         default:
             *rc = n;
-            return (0);
+            return 0;
     }
 }
 
 int
-pt_remove_r(struct pt_context *pt, struct pt_node *n, u_char *key,
-        struct pt_node *prev)
+pt_remove_r(struct pt_context *pt, struct pt_node *n, uint8_t *key,
+            struct pt_node *prev)
 {
     struct pt_node *tmp;
 
     if (n == NULL)
-    {
-        return (0);
-    }
+        return 0;
 
-    /* extract bit from the key */
-    switch (get_bit(key, n))
-    {
+    switch (get_bit(key, n)) {
         case 0:
-            /* recurse down the left of this node */
-            return (pt_remove_r(pt, n->l, key, n));
-            break;
+            return pt_remove_r(pt, n->l, key, n);
         case 1:
-            /* recurse down the right of this node */
-            return (pt_remove_r(pt, n->r, key, n));
-            break;
+            return pt_remove_r(pt, n->r, key, n);
         case 2:
-            /*
-             *  Found the node to remove, deallocate its data and move
-             *  the sibling data node up one.
-             */
             free(n->con);
-            n->con = (struct tcp_connection *)CON_REMOVED;
-            /*
-             *  This will happen if the connection just removed was the
-             *  only thing in the trie, and therefore in the root node.
-             */
+            n->con = NULL;
+            n->removed = true;
+
             if (prev == NULL)
-            {
-                return (1);
-            }
-            /*
-             *  If the left child node was removed, move up the values
-             *  from the right and then free the unused nodes.
-             */
-            if ((int)prev->l->con == CON_REMOVED)
-            {
+                return 1;
+
+            if (prev->l && prev->l->removed) {
                 tmp = prev->r->r;
                 free(prev->l);
-                prev->con = prev->r->con; 
+                prev->con = prev->r->con;
                 prev->bit = prev->r->bit;
-                prev->l   = prev->r->l;
+                prev->l = prev->r->l;
                 free(prev->r);
                 prev->r = tmp;
-            }
-            /*
-             *  The right child was removed, so move up the values from
-             *  the left child and then free the unused nodes.
-             */
-            else
-            {
+            } else {
                 tmp = prev->l->l;
                 free(prev->r);
-                prev->con = prev->l->con; 
+                prev->con = prev->l->con;
                 prev->bit = prev->l->bit;
-                prev->r   = prev->l->r;
+                prev->r = prev->l->r;
                 free(prev->l);
                 prev->l = tmp;
             }
-            /* decrement node counter in trie context structure */
             pt->n -= 2;
-            return (1);
+            return 1;
         default:
-            return (0);
+            return 0;
     }
 }
 
-void 
+void
 pt_delete(struct pt_context *pt, struct tcp_connection *c)
 {
-    u_char key[KEY_BYTES];
+    uint8_t key[KEY_BYTES];
 
-    /* if the trie is empty, just return */
     if (pt->head == NULL)
-    {
         return;
-    }
-    /* generate the trie key for this connection record */
-    memset(key, NULL, KEY_BYTES);
+
+    memset(key, 0, KEY_BYTES);
     pt_make_key(key, c);
 
-    /* call the recursive search and delete function */
-    if (pt_remove_r(pt, pt->head, key, NULL))
-    {
-        /* 
-         *  If we just deleted the last connection record in the trie
-         *  then remove the last node so we have a totally empty trie.
-         */
-        if (pt->n == 1 && (int)(pt->head->con) == CON_REMOVED)
-        {
-             free(pt->head);
-             pt->head = NULL;
-             pt->n = 0;
+    if (pt_remove_r(pt, pt->head, key, NULL)) {
+        if (pt->n == 1 && pt->head->removed) {
+            free(pt->head);
+            pt->head = NULL;
+            pt->n = 0;
         }
     }
 }
@@ -572,183 +467,125 @@ int
 pt_find(struct pt_context *pt, struct tcp_connection *c,
         struct tcp_connection **rc)
 {
-    u_char key[KEY_BYTES];
-    struct pt_node *rn;
+    uint8_t key[KEY_BYTES];
+    struct pt_node *rn = NULL;
     int r;
 
-    if (pt->head == NULL)
-    {
-        /* can't find anything in a NULL trie */
+    if (pt->head == NULL) {
         *rc = NULL;
-        return (0);
+        return 0;
     }
 
-    /* get a key for this connection */
-    memset(key, NULL, KEY_BYTES);
+    memset(key, 0, KEY_BYTES);
     pt_make_key(key, c);
 
-    rn = NULL;
     r = pt_search_r(pt->head, key, &rn);
+    if (rn)
+        *rc = rn->con;
+    else
+        *rc = NULL;
 
-   /* point the retrieved connection to the node found */ 
-    *rc = rn->con;
-
-    return (r);
+    return r;
 }
 
 int
-diff_bit(u_char *key1, u_char *key2, int *b)
+diff_bit(const uint8_t *key1, const uint8_t *key2, int *b)
 {
     int i, j;
-    unsigned char v;
+    uint8_t v;
 
-    /* iterate through all key bytes */
-    for (i = 0; i < KEY_BYTES; i++)
-    {
-        /* XOR each byte to find the first differing key byte */
-        if ((v = key1[i] ^ key2[i]))
-        {
-            /*
-             *  Found a two differing bytes, now shift through each bit
-             *  of the XOR result to find the first differing key bit.
-             */
-            for (j = 0; j < 8; j++)
-            {
-                /* left shift with bitwise AND with a high bit mask */
-                if (v << j & 0x80)
-                {
-                    /*
-                     *  Isolate the differring bit in key1 and place the
-                     *  actual value of the bit in b.
-                     */
-                    *b = key1[i] >> (7 - j) & 0x01;
-                    /*
-                     *  Return the number of bits from the left that the
-                     *  first bit difference occurs between key1 and key2.
-	             */
+    for (i = 0; i < KEY_BYTES; i++) {
+        if ((v = key1[i] ^ key2[i])) {
+            for (j = 0; j < 8; j++) {
+                if ((uint8_t)(v << j) & 0x80) {
+                    *b = (key1[i] >> (7 - j)) & 0x01;
                     return (i * 8 + j);
                 }
             }
         }
     }
-    /* no difference */
-    return (MAX_KEY_BIT);
+    return MAX_KEY_BIT;
 }
 
 int
 pt_insert(struct pt_context *pt, struct tcp_connection *c)
 {
     struct pt_node *rn = NULL;
-    u_char key1[KEY_BYTES], key2[KEY_BYTES];
+    uint8_t key1[KEY_BYTES], key2[KEY_BYTES];
     int b;
 
-    if (pt->head == NULL)
-    {
-        /* make a new head node */
+    if (pt->head == NULL) {
         pt->head = pt_new(MIN_KEY_BIT - 1, NULL, NULL, c);
-        if (pt->head == NULL)
-        {
-            perror("pt_insert(): malloc(): ");
-            return (0);
+        if (pt->head == NULL) {
+            perror("pt_insert(): calloc()");
+            return 0;
         }
-        else
-        {
-            /* increment node counter and return success */
-            pt->n++;
-            return (1);
-        }
+        pt->n++;
+        return 1;
     }
-    else
-    {
-        memset(key1, NULL, KEY_BYTES);
-        pt_make_key(key1, c);
 
-        switch (pt_search_r(pt->head, key1, &rn))
-        {
-            case 0:
-                memset(key2, NULL, KEY_BYTES);
-	        pt_make_key(key2, rn->con);
+    memset(key1, 0, KEY_BYTES);
+    pt_make_key(key1, c);
 
-                /* find the first differing bit, and its value */
-                rn->bit = diff_bit(key1, key2, &b);
+    switch (pt_search_r(pt->head, key1, &rn)) {
+        case 0: {
+            memset(key2, 0, KEY_BYTES);
+            pt_make_key(key2, rn->con);
 
-                if (((b ? rn->r : rn->l) =
-                    pt_new(MIN_KEY_BIT - 1, NULL, NULL, c)) == NULL)
-                {
-                    return (0);
-                }
+            rn->bit = diff_bit(key1, key2, &b);
 
-                if (((b ? rn->l : rn->r) =
-                    pt_new(MIN_KEY_BIT - 1, NULL, NULL, rn->con)) == NULL)
-                {
-                    free(b ? rn->r : rn->l);
-                    return (0);
-                }
-                rn->con = NULL;
-                /* added two new nodes */
-                pt->n += 2;
-                return (1);
-            case 1:
-                return (2);
+            struct pt_node *new_node = pt_new(MIN_KEY_BIT - 1, NULL, NULL, c);
+            if (new_node == NULL)
+                return 0;
+
+            struct pt_node *sib_node = pt_new(MIN_KEY_BIT - 1, NULL, NULL, rn->con);
+            if (sib_node == NULL) {
+                free(new_node);
+                return 0;
+            }
+
+            if (b) {
+                rn->r = new_node;
+                rn->l = sib_node;
+            } else {
+                rn->l = new_node;
+                rn->r = sib_node;
+            }
+            rn->con = NULL;
+            pt->n += 2;
+            return 1;
         }
+        case 1:
+            return 2;
     }
-    return (0);
+    return 0;
 }
 
-void 
+void
 pt_walk_r(struct descry_pack *gp, struct pt_node *cur,
-        struct pt_node *pre, struct timeval* ts)
+          struct pt_node *pre, struct timeval *ts)
 {
     struct timeval tsdif;
 
     if (cur == NULL || pre == NULL)
-    {
-        /* can't walk a NULL trie */
         return;
-    }
 
-    /* if this is a decision node, then keep walking */
-    if (cur->bit >= MIN_KEY_BIT && cur->bit <= MAX_KEY_BIT)
-    {
+    if (cur->bit >= MIN_KEY_BIT && cur->bit <= MAX_KEY_BIT) {
         pt_walk_r(gp, cur->l, cur, ts);
-    }
-
-    /* looks like a data node, so check the connection values */
-    else if (NULL != cur->con)
-    {
+    } else if (cur->con != NULL) {
         PTIMERSUB(ts, &(cur->con->ts), &tsdif);
 
-        /*
-         *  If the timestamp on the current connection is too old
-         *  remove it.
-         */
         if (EXPIRE_TIME < tsdif.tv_sec)
-        {
             pt_delete(gp->pt, cur->con);
-        }
 
-        /* return if we reach the far right or the root node */
         if (cur == pre || cur == pre->r)
-        {
             return;
-        }
 
-        /* otherwise, go up one and to the right */
         pt_walk_r(gp, pre->r, pre, ts);
-    }
-    else
-    {
-        /*
-         *  If we hit this code block we have major problems -- a node
-         *  looks like it is a data node, but it has no data.  We'll
-         *  warn and bail immediately.
-         */
-        if (gp->flags & DO_SYSLOG)
-        {
+    } else {
+        if (gp->flags & DO_SYSLOG) {
             syslog(LOG_WARNING, "Internal data structure corrupted!");
-        }
-        else
-        {
+        } else {
             fprintf(stderr, "Internal data structure corrupted!\n");
         }
         abort();
@@ -756,34 +593,25 @@ pt_walk_r(struct descry_pack *gp, struct pt_node *cur,
 }
 
 void
-pt_expire(struct descry_pack *gp, struct timeval* ts)
+pt_expire(struct descry_pack *gp, struct timeval *ts)
 {
-    /* walk the tree and expire old connections */
     pt_walk_r(gp, gp->pt->head, gp->pt->head, ts);
 }
 
-char *
-get_time()
+const char *
+get_time(void)
 {
-    int i;
-    time_t t;
-    static char buf[26];
+    static char buf[32];
+    time_t t = time(NULL);
+    struct tm tm_buf;
 
-    t = time((time_t *)NULL);
-    strcpy(buf, ctime(&t));
-
-    /* cut out the day, year and \n */
-    for (i = 0; i < 20; i++)
-    {
-        buf[i] = buf[i + 4];
-    }
-    buf[15] = 0;
-
-    return (buf);
+    localtime_r(&t, &tm_buf);
+    strftime(buf, sizeof(buf), "%b %d %H:%M:%S", &tm_buf);
+    return buf;
 }
 
 void
-usage(char* name)
+usage(const char *name)
 {
     fprintf(stderr,
             "usage %s [options] (-i and -f are mutually exclusive)\n"
@@ -792,5 +620,3 @@ usage(char* name)
             "-f capture file\tspecify tcpdump capture file\n"
             "-s\t\tlog to syslog instead of stderr\n", name);
 }
-
-/* EOF */
